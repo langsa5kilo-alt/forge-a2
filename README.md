@@ -1,5 +1,9 @@
 # forge-a2
 
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/langsa5kilo-alt/forge-a2/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/langsa5kilo-alt/forge-a2/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
 forge-a2 is a compact, memory-resident GitHub-compatible forge written in Go. A tiny Node 22 launcher selects the static binary for the host architecture. The server implements REST v3, GraphQL, MCP, and Git smart HTTP without invoking Git or using third-party packages.
 
 Build both committed executables from the repository root:
