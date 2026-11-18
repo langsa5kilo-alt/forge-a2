@@ -235,6 +235,17 @@ func serveConn(c net.Conn, handler http.Handler) {
 				continue
 			}
 		}
+		if fields[0] == "GET" && fields[1] == "/healthz" {
+			const p = `{"ok":true}`
+			fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nX-GitHub-Request-Id: forge-a2\r\n\r\n%s", len(p), p)
+			if err = bw.Flush(); err != nil {
+				return
+			}
+			if strings.EqualFold(connection, "close") {
+				return
+			}
+			continue
+		}
 		rw := &rawResponse{header: make(http.Header, 8)}
 		fast := false
 		if store, ok := handler.(*Store); ok && fastCandidate && authorization == "Bearer "+store.token {
