@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"compress/zlib"
 	"crypto/sha1"
@@ -46,6 +47,15 @@ type Issue struct {
 	Labels   []Label   `json:"labels"`
 	Comments []Comment `json:"-"`
 	Cached   []byte    `json:"-"`
+}
+type issueWire struct {
+	ID     int64   `json:"id"`
+	NodeID string  `json:"node_id"`
+	Number int     `json:"number"`
+	Title  string  `json:"title"`
+	Body   string  `json:"body"`
+	State  string  `json:"state"`
+	Labels []Label `json:"labels"`
 }
 type Label struct {
 	Name  string `json:"name"`
@@ -93,8 +103,7 @@ func main() {
 		panic(err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	srv := &http.Server{Handler: s, ReadHeaderTimeout: 5 * time.Second}
-	go srv.Serve(ln)
+	go serveHTTP1(ln, s)
 	env := os.Getenv("MAKEFUN_ENV_URL")
 	body, _ := json.Marshal(map[string]int{"port": port})
 	for {
@@ -124,7 +133,150 @@ func main() {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	srv.Close()
+	ln.Close()
+}
+
+type rawResponse struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+}
+
+func (w *rawResponse) Header() http.Header { return w.header }
+func (w *rawResponse) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+func (w *rawResponse) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = 200
+	}
+	return w.body.Write(p)
+}
+func serveHTTP1(ln net.Listener, handler http.Handler) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go serveConn(c, handler)
+	}
+}
+func serveConn(c net.Conn, handler http.Handler) {
+	defer c.Close()
+	br, bw := bufio.NewReaderSize(c, 64<<10), bufio.NewWriterSize(c, 64<<10)
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return
+		}
+		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+		fields := strings.Fields(line)
+		if len(fields) != 3 {
+			return
+		}
+		fastCandidate := (fields[0] == "GET" && strings.HasPrefix(fields[1], "/api/v3/repos/") && strings.Contains(fields[1], "/issues/")) || (fields[0] == "POST" && strings.HasPrefix(fields[1], "/api/v3/repos/") && strings.HasSuffix(fields[1], "/issues"))
+		var h http.Header
+		if !fastCandidate {
+			h = make(http.Header, 8)
+		}
+		authorization, connection := "", ""
+		n := 0
+		for {
+			line, err = br.ReadString('\n')
+			if err != nil {
+				return
+			}
+			if line == "\r\n" || line == "\n" {
+				break
+			}
+			colon := strings.IndexByte(line, ':')
+			if colon < 1 {
+				return
+			}
+			name, value := strings.TrimSpace(line[:colon]), strings.TrimSpace(line[colon+1:])
+			if strings.EqualFold(name, "Authorization") {
+				authorization = value
+			}
+			if strings.EqualFold(name, "Connection") {
+				connection = value
+			}
+			if strings.EqualFold(name, "Content-Length") {
+				n, _ = strconv.Atoi(value)
+			}
+			if h != nil {
+				h.Add(name, value)
+			}
+		}
+		body := make([]byte, n)
+		if n > 0 {
+			if _, err = io.ReadFull(br, body); err != nil {
+				return
+			}
+		}
+		if store, ok := handler.(*Store); ok && fastCandidate && authorization == "Bearer "+store.token {
+			data, status, ok := []byte(nil), 0, false
+			if fields[0] == "GET" {
+				data, ok = store.issueBytes(fields[1])
+				status = 200
+			} else {
+				data, status, ok = store.rawIssueCreate(fields[1], body)
+			}
+			if ok {
+				fmt.Fprintf(bw, "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: forge-a2\r\nContent-Length: %d\r\n\r\n", status, http.StatusText(status), len(data))
+				bw.Write(data)
+				if err = bw.Flush(); err != nil {
+					return
+				}
+				if strings.EqualFold(connection, "close") {
+					return
+				}
+				continue
+			}
+		}
+		rw := &rawResponse{header: make(http.Header, 8)}
+		fast := false
+		if store, ok := handler.(*Store); ok && fastCandidate && authorization == "Bearer "+store.token {
+			fast = store.fastIssueRead(rw, fields[1])
+		}
+		if !fast {
+			if h == nil {
+				h = make(http.Header, 4)
+				h.Set("Authorization", authorization)
+				if connection != "" {
+					h.Set("Connection", connection)
+				}
+			}
+			u, err := url.ParseRequestURI(fields[1])
+			if err != nil {
+				return
+			}
+			req := &http.Request{Method: fields[0], URL: u, Proto: fields[2], ProtoMajor: 1, ProtoMinor: 1, Header: h, Body: io.NopCloser(bytes.NewReader(body)), ContentLength: int64(n), Host: h.Get("Host"), RemoteAddr: c.RemoteAddr().String()}
+			handler.ServeHTTP(rw, req)
+		}
+		status := rw.status
+		if status == 0 {
+			status = 200
+		}
+		if rw.header.Get("Content-Length") == "" {
+			rw.header.Set("Content-Length", strconv.Itoa(rw.body.Len()))
+		}
+		fmt.Fprintf(bw, "HTTP/1.1 %d %s\r\n", status, http.StatusText(status))
+		for k, values := range rw.header {
+			for _, v := range values {
+				fmt.Fprintf(bw, "%s: %s\r\n", k, v)
+			}
+		}
+		bw.WriteString("\r\n")
+		bw.Write(rw.body.Bytes())
+		if err = bw.Flush(); err != nil {
+			return
+		}
+		if strings.EqualFold(connection, "close") || strings.EqualFold(rw.header.Get("Connection"), "close") {
+			return
+		}
+	}
 }
 
 func tokenOwner(t string) string {
@@ -151,6 +303,12 @@ func (s *Store) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/api/v3/repos/") && s.fastIssueRead(w, r.URL.Path) {
+		return
+	}
+	if r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/api/v3/repos/") && s.fastIssueCreate(w, r) {
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/api/v3") {
 		s.rest(w, r)
 		return
@@ -168,6 +326,100 @@ func (s *Store) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOut(w, 404, map[string]any{"message": "Not Found"})
+}
+func (s *Store) fastIssueRead(w http.ResponseWriter, path string) bool {
+	b, ok := s.issueBytes(path)
+	if !ok {
+		return false
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-GitHub-Request-Id", "forge-a2")
+	w.WriteHeader(200)
+	w.Write(b)
+	return true
+}
+func (s *Store) issueBytes(path string) ([]byte, bool) {
+	p := strings.TrimPrefix(path, "/api/v3/repos/")
+	parts := strings.Split(p, "/")
+	if len(parts) != 4 || parts[2] != "issues" {
+		return nil, false
+	}
+	n, err := strconv.Atoi(parts[3])
+	if err != nil {
+		return nil, false
+	}
+	x := s.get(parts[0], parts[1])
+	if x == nil {
+		return nil, false
+	}
+	x.RLock()
+	if n < 1 || n > len(x.Issues) {
+		x.RUnlock()
+		return nil, false
+	}
+	b := x.Issues[n-1].Cached
+	x.RUnlock()
+	return b, true
+}
+func (s *Store) fastIssueCreate(w http.ResponseWriter, r *http.Request) bool {
+	p := strings.TrimPrefix(r.URL.Path, "/api/v3/repos/")
+	parts := strings.Split(p, "/")
+	if len(parts) != 3 || parts[2] != "issues" {
+		return false
+	}
+	var body struct {
+		Title  string   `json:"title"`
+		Body   string   `json:"body"`
+		Labels []string `json:"labels"`
+	}
+	if !decode(r, &body) {
+		restErr(w, 400, "Invalid JSON")
+		return true
+	}
+	x := s.get(parts[0], parts[1])
+	if x == nil {
+		return false
+	}
+	x.Lock()
+	i, err := s.createIssue(x, body.Title, body.Body, body.Labels)
+	x.Unlock()
+	if err != nil {
+		restErr(w, 422, err.Error())
+		return true
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-GitHub-Request-Id", "forge-a2")
+	w.WriteHeader(201)
+	w.Write(i.Cached)
+	return true
+}
+func (s *Store) rawIssueCreate(path string, raw []byte) ([]byte, int, bool) {
+	p := strings.TrimPrefix(path, "/api/v3/repos/")
+	parts := strings.Split(p, "/")
+	if len(parts) != 3 || parts[2] != "issues" {
+		return nil, 0, false
+	}
+	var body struct {
+		Title  string   `json:"title"`
+		Body   string   `json:"body"`
+		Labels []string `json:"labels"`
+	}
+	if json.Unmarshal(raw, &body) != nil {
+		b, _ := json.Marshal(map[string]any{"message": "Invalid JSON"})
+		return b, 400, true
+	}
+	x := s.get(parts[0], parts[1])
+	if x == nil {
+		return nil, 0, false
+	}
+	x.Lock()
+	issue, err := s.createIssue(x, body.Title, body.Body, body.Labels)
+	x.Unlock()
+	if err != nil {
+		b, _ := json.Marshal(map[string]any{"message": err.Error()})
+		return b, 422, true
+	}
+	return issue.Cached, 201, true
 }
 func jsonOut(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -532,6 +784,9 @@ func (s *Store) labels(w http.ResponseWriter, r *http.Request, x *Repo) {
 func issueJSON(i *Issue) map[string]any {
 	return map[string]any{"id": i.ID, "node_id": i.NodeID, "number": i.Number, "title": i.Title, "body": i.Body, "state": i.State, "labels": i.Labels}
 }
+func cacheIssue(i *Issue) {
+	i.Cached, _ = json.Marshal(issueWire{i.ID, i.NodeID, i.Number, i.Title, i.Body, i.State, i.Labels})
+}
 func (s *Store) createIssue(x *Repo, title, body string, labels []string) (*Issue, error) {
 	ls := []Label{}
 	for _, n := range labels {
@@ -543,7 +798,7 @@ func (s *Store) createIssue(x *Repo, title, body string, labels []string) (*Issu
 	}
 	id := s.alloc()
 	i := &Issue{ID: id, NodeID: gid("Issue", id), Number: len(x.Issues) + 1, Title: title, Body: body, State: "open", Labels: ls}
-	i.Cached, _ = json.Marshal(issueJSON(i))
+	cacheIssue(i)
 	x.Issues = append(x.Issues, i)
 	return i, nil
 }
@@ -612,7 +867,7 @@ func (s *Store) issues(w http.ResponseWriter, r *http.Request, x *Repo, parts []
 		if b.State != "" {
 			i.State = b.State
 		}
-		i.Cached, _ = json.Marshal(issueJSON(i))
+		cacheIssue(i)
 	}
 	restOut(w, 200, issueJSON(i))
 }
@@ -938,6 +1193,7 @@ func (s *Store) graphOne(m map[string]any) any {
 		}
 		if found != nil {
 			found.State = "closed"
+			cacheIssue(found)
 		}
 		return map[string]any{"data": map[string]any{"closeIssue": map[string]any{"issue": graphIssue(found)}}}
 	}
@@ -1227,9 +1483,9 @@ func (s *Store) gitHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	x.Lock()
-	defer x.Unlock()
 	if action == "refs" {
+		x.RLock()
+		defer x.RUnlock()
 		service := r.URL.Query().Get("service")
 		if service == "git-upload-pack" && strings.Contains(r.Header.Get("Git-Protocol"), "version=2") {
 			w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
@@ -1267,6 +1523,8 @@ func (s *Store) gitHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if action == "git-receive-pack" {
+		x.Lock()
+		defer x.Unlock()
 		w.Header().Set("Content-Type", "application/x-git-receive-pack-result")
 		s.receive(w, r, x)
 		return
@@ -1339,6 +1597,9 @@ func (s *Store) receive(w http.ResponseWriter, r *http.Request, x *Repo) {
 		} else {
 			report.Write(pkt("ng " + c.ref + " non-fast-forward\n"))
 		}
+	}
+	if len(cmds) > 0 {
+		x.PackCache = map[string][]byte{}
 	}
 	report.WriteString("0000")
 	var side bytes.Buffer
@@ -1524,6 +1785,22 @@ func (s *Store) upload(w http.ResponseWriter, r *http.Request, x *Repo) {
 			prefixes = append(prefixes, strings.TrimPrefix(z, "ref-prefix "))
 		}
 	}
+	locked := true
+	readLocked := cmd == "ls-refs"
+	if readLocked {
+		x.RLock()
+	} else {
+		x.Lock()
+	}
+	defer func() {
+		if locked {
+			if readLocked {
+				x.RUnlock()
+			} else {
+				x.Unlock()
+			}
+		}
+	}()
 	if cmd == "ls-refs" {
 		var b bytes.Buffer
 		if len(x.Refs) == 0 {
@@ -1560,6 +1837,17 @@ func (s *Store) upload(w http.ResponseWriter, r *http.Request, x *Repo) {
 		w.Write([]byte("0000"))
 		return
 	}
+	cacheKey := ""
+	if cmd == "fetch" && depth > 0 && len(haves) == 0 {
+		cacheKey = strings.Join(wants, ",") + ":" + strconv.Itoa(depth)
+		if cached := x.PackCache[cacheKey]; cached != nil {
+			answer := append([]byte(nil), cached...)
+			x.Unlock()
+			locked = false
+			w.Write(answer)
+			return
+		}
+	}
 	if hasShallow {
 		haves = map[string]bool{}
 	}
@@ -1586,7 +1874,11 @@ func (s *Store) upload(w http.ResponseWriter, r *http.Request, x *Repo) {
 			pack = pack[n:]
 		}
 		b.WriteString("0000")
-		w.Write(b.Bytes())
+		answer := b.Bytes()
+		if cacheKey != "" {
+			x.PackCache[cacheKey] = append([]byte(nil), answer...)
+		}
+		w.Write(answer)
 		return
 	}
 	var b bytes.Buffer
